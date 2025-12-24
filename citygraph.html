@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>City Graph</title>
+
+<!-- Leaflet -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<style>
+html,body{
+  margin:0;
+  height:100%;
+  width:100%;
+  font-family:"Poppins",sans-serif;
+}
+#map{
+  height:100%;
+  width:100%;
+  z-index:1;
+}
+.glass-panel{
+  position:absolute;
+  top:20px;
+  right:20px;
+  z-index:1000;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  padding:16px;
+  border-radius:16px;
+  backdrop-filter:blur(11px);
+  background:rgba(96, 96, 96, 0.55);
+  box-shadow:0 4px 20px rgba(0,0,0,0.3);
+  color:#fff;
+  min-width:160px;
+}
+.glass-panel button{
+  background:rgba(255,255,255,0.1);
+  border:1px solid rgba(255,255,255,0.2);
+  border-radius:10px;
+  padding:8px;
+  color:#fff;
+  font-weight:600;
+  cursor:pointer;
+  transition:0.2s;
+}
+.glass-panel button:hover{
+  background:rgba(255,255,255,0.25);
+}
+.glass-panel h3{
+  margin:0 0 8px 0;
+  text-align:center;
+  font-weight:700;
+}
+.leaflet-tooltip{ 
+  background: rgba(0,0,0,0.6); 
+  color: #fff;
+  border: none; 
+}
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div class="glass-panel">
+  <h3>City Graph</h3>
+  <button id="addNode">Select Location</button>
+  <button id="routes">Possible Routes</button>
+  <button id="dijkstra">Shortest Route</button>
+  <button id="dfs">Explore City</button>
+  <button id="clear">Clear</button>
+</div>
+
+<script>
+const map = L.map('map').setView([28.6139, 77.2090], 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+
+let nodes = [];
+let edges = [];
+let graph = {};
+let displayedRoutes = [];
+let addMode = false;
+
+function makeNodeId(idx){ return 'N' + (idx+1); }
+function generateEdgeId(){ return 'E' + Date.now() + Math.floor(Math.random()*9999); }
+
+function clearDisplayedRoutes(){
+  displayedRoutes.forEach(r => { try{ map.removeLayer(r.polyline); } catch(e){} });
+  displayedRoutes = [];
+}
+function clearEdges(){
+  edges.forEach(e=>{ try{ map.removeLayer(e.polyline);}catch(e){} });
+  edges = [];
+  graph = {};
+}
+function clearNodes(){
+  nodes.forEach(n=>{ try{ map.removeLayer(n.marker);}catch(e){} });
+  nodes = [];
+}
+function clearAll(){
+  clearDisplayedRoutes();
+  clearEdges();
+  clearNodes();
+  graph = {};
+  addMode = false;
+  document.getElementById('addNode').style.opacity = '1';
+}
+
+const btnAdd = document.getElementById('addNode');
+const btnRoutes = document.getElementById('routes');
+const btnDijkstra = document.getElementById('dijkstra');
+const btnDFS = document.getElementById('dfs');
+const btnClear = document.getElementById('clear');
+
+btnAdd.addEventListener('click', ()=> {
+  addMode = !addMode;
+  btnAdd.style.opacity = addMode ? '0.85' : '1';
+  map.getContainer().style.cursor = addMode ? 'crosshair' : '';
+});
+
+btnClear.addEventListener('click', ()=> clearAll());
+
+function createNode(latlng){
+  const id = makeNodeId(nodes.length);
+  const marker = L.circleMarker(latlng, { radius: 9, color:'#2a9d8f', fillColor:'#2a9d8f', fillOpacity:1 })
+    .addTo(map)
+    .bindTooltip(id, {permanent:true, direction:'top', className:'node-tooltip'});
+  marker.on('click', (e) => {
+    e.originalEvent.cancelBubble = true;
+    toggleNodeSelection(id);
+  });
+  const nodeObj = { id, latlng, marker, selected: false };
+  nodes.push(nodeObj);
+  graph[id] = graph[id] || {};
+  return nodeObj;
+}
+
+function toggleNodeSelection(id){
+  const n = nodes.find(x => x.id === id);
+  if(!n) return;
+  n.selected = !n.selected;
+  if(n.selected){
+    n.marker.setStyle({ color:'#00ffe1', fillColor:'#00ffe1' });
+  } else {
+    n.marker.setStyle({ color:'#2a9d8f', fillColor:'#2a9d8f' });
+  }
+}
+
+// add new nodes when in "add mode"
+map.on('click', function(e){
+  if(!addMode) {
+    const clicked = nodes.find(n => map.distance(n.latlng, e.latlng) < 50); // 50 meters
+    if(clicked){ toggleNodeSelection(clicked.id); }
+    return;
+  }
+  createNode(e.latlng);
+  addMode = false;
+  btnAdd.style.opacity = '1';
+  map.getContainer().style.cursor = '';
+});
+
+// ---------------- OSRM helpers ----------------
+async function osrmRoute(aLatLng, bLatLng, alternatives=false, maxAlternatives=5){
+  const base = 'https://router.project-osrm.org/route/v1/driving/';
+  const coords = `${aLatLng.lng},${aLatLng.lat};${bLatLng.lng},${bLatLng.lat}`;
+  const url = `${base}${coords}?overview=full&geometries=geojson&alternatives=${alternatives?maxAlternatives:0}`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error('OSRM failure');
+  const json = await res.json();
+  if(json.code !== 'Ok') throw new Error('OSRM returned ' + json.code);
+  return json.routes;
+}
+
+// ---------------- Edge creation ----------------
+async function addEdgeBetween(aId, bId){
+  const aNode = nodes.find(n=>n.id===aId);
+  const bNode = nodes.find(n=>n.id===bId);
+  if(!aNode || !bNode) return;
+  if(graph[aId] && graph[aId][bId] !== undefined) return;
+  try{
+    const routes = await osrmRoute(aNode.latlng, bNode.latlng, false);
+    if(!routes || routes.length===0) throw new Error('no routes');
+    const route = routes[0];
+    const coords = route.geometry.coordinates.map(c => [c[1], c[0]]);
+    const distKm = map.distance(aNode.latlng, bNode.latlng) / 1000;
+    const poly = L.polyline(coords, { color:'#9aa6ad', weight:3, opacity:0.8 }).addTo(map);
+    edges.push({ id: generateEdgeId(), aId, bId, polyline: poly, distKm });
+    graph[aId] = graph[aId] || {}; graph[bId] = graph[bId] || {};
+    graph[aId][bId] = distKm; graph[bId][aId] = distKm;
+  }catch(err){
+    const distKm = map.distance(aNode.latlng, bNode.latlng) / 1000;
+    const poly = L.polyline([aNode.latlng, bNode.latlng], { color:'#9aa6ad', weight:3, opacity:0.6, dashArray:'6 6' }).addTo(map);
+    edges.push({ id: generateEdgeId(), aId, bId, polyline: poly, distKm });
+    graph[aId] = graph[aId] || {}; graph[bId] = graph[bId] || {};
+    graph[aId][bId] = distKm; graph[bId][aId] = distKm;
+  }
+}
+
+// ---------------- Possible Routes ----------------
+btnRoutes.addEventListener('click', async ()=>{
+  clearDisplayedRoutes();
+  const selected = nodes.filter(n=>n.selected).map(n=>n.id);
+  if(selected.length < 2){
+    alert('Select at least two nodes before pressing Possible Routes.');
+    return;
+  }
+
+  if(selected.length === 2){
+    const a = nodes.find(n=>n.id===selected[0]);
+    const b = nodes.find(n=>n.id===selected[1]);
+    try{
+      const routes = await osrmRoute(a.latlng, b.latlng, true, 5);
+      if(!routes || routes.length === 0){
+        alert('No routes found by OSRM.');
+        return;
+      }
+      const colors = ['#ff7f50','#59c1bd','#ffd166','#FF0000','#b08cff'];
+      routes.slice(0,5).forEach((rt, idx) => {
+        const coords = rt.geometry.coordinates.map(c=>[c[1], c[0]]);
+        const color = colors[idx % colors.length];
+        const poly = L.polyline(coords, { color, weight: 6 - Math.min(3,idx), opacity:0.85 }).addTo(map);
+        displayedRoutes.push({ id: 'R' + idx, coords, distanceKm: map.distance(a.latlng,b.latlng) / 1000, duration: rt.duration, polyline: poly, color });
+      });
+      const group = L.featureGroup(displayedRoutes.map(r=>r.polyline));
+      map.fitBounds(group.getBounds().pad(0.2));
+    }catch(err){
+      console.error(err);
+      alert('OSRM failed — cannot fetch alternate routes.');
+    }
+    return;
+  }
+
+  for(let i=0;i<selected.length;i++){
+    for(let j=i+1;j<selected.length;j++){
+      await addEdgeBetween(selected[i], selected[j]);
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+  alert('Possible routes added for selected nodes.');
+});
+
+// ---------------- Shortest Route ----------------
+btnDijkstra.addEventListener('click', async ()=>{
+  clearDisplayedRoutes();
+  const sel = nodes.filter(n=>n.selected);
+  if(sel.length !== 2){
+    alert('Select exactly two nodes for Shortest Route.');
+    return;
+  }
+  const a = sel[0], b = sel[1];
+  try{
+    const routes = await osrmRoute(a.latlng, b.latlng, false);
+    if(!routes || routes.length === 0) { alert('No route found'); return; }
+    const rt = routes[0];
+    const coords = rt.geometry.coordinates.map(c=>[c[1], c[0]]);
+    const poly = L.polyline(coords, { color:'#ff7f50', weight:7, opacity:0.95 }).addTo(map);
+    displayedRoutes.push({ id:'best', coords, distanceKm: map.distance(a.latlng,b.latlng) / 1000, duration: rt.duration, polyline: poly, color:'#ff7f50' });
+    map.fitBounds(poly.getBounds().pad(0.2));
+  }catch(err){
+    console.error(err);
+    alert('OSRM failed — drawing straight fallback line.');
+    const coords = [a.latlng, b.latlng];
+    const poly = L.polyline(coords, { color:'#ff7f50', weight:7, opacity:0.95 }).addTo(map);
+    displayedRoutes.push({ id:'fallback', coords, distanceKm: map.distance(a.latlng,b.latlng)/1000, duration: 0, polyline: poly, color:'#ff7f50' });
+  }
+});
+
+// ---------------- Explore City (DFS) ----------------
+btnDFS.addEventListener('click', async ()=>{
+  const selected = nodes.filter(n=>n.selected).map(n=>n.id);
+  if(selected.length < 1){
+    alert('Select at least one node to start Explore City.');
+    return;
+  }
+  const startId = selected[0];
+  const roadMap = {};
+  edges.forEach(e => {
+    roadMap[e.aId + '-' + e.bId] = e;
+    roadMap[e.bId + '-' + e.aId] = e;
+  });
+
+  const visited = new Set();
+  const order = [];
+  function dfs(u){
+    visited.add(u); order.push(u);
+    if(!graph[u]) return;
+    for(const v in graph[u]){
+      if(!visited.has(v)) dfs(v);
+    }
+  }
+  dfs(startId);
+
+  clearDisplayedRoutes();
+  for(let i=0;i<order.length-1;i++){
+    const a = order[i], b = order[i+1];
+    const key = a + '-' + b;
+    const e = roadMap[key];
+    if(e && e.polyline){
+      const coords = e.polyline.getLatLngs();
+      const pl = L.polyline(coords, { color:'#00ffff', weight:5, opacity:0.9 }).addTo(map);
+      displayedRoutes.push({ id:'expl-'+i, polyline:pl });
+    } else {
+      const A = nodes.find(n=>n.id===a), B = nodes.find(n=>n.id===b);
+      if(A && B){
+        const pl = L.polyline([A.latlng, B.latlng], { color:'#00ffff', weight:5, opacity:0.8, dashArray:'6 6'}).addTo(map);
+        displayedRoutes.push({ id:'expl-'+i, polyline:pl });
+      }
+    }
+    await new Promise(r=>setTimeout(r, 380));
+  }
+  alert('Exploration finished (order): ' + order.join(' → '));
+});
+
+console.log('CityGraph: node-based version loaded successfully.');
+</script>
+
+</body>
+</html>
+
+
